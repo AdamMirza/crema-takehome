@@ -1,3 +1,5 @@
+from watermark_detector import WatermarkDetector
+
 def process_video(video_path):
     """
     Process a video file.
@@ -8,22 +10,24 @@ def process_video(video_path):
     Returns:
         dict: Results of the video processing.
     """
-    # This is a placeholder for your actual video processing logic
-    # You would implement your specific video processing here
+    # Initialize the watermark detector
+    detector = WatermarkDetector()
     
-    # Example: You might use libraries like OpenCV, PyTorch, TensorFlow, etc.
-    # import cv2
-    # cap = cv2.VideoCapture(video_path)
-    # ... process frames ...
+    # Detect watermark
+    watermark_results = detector.detect_tiktok_watermark(video_path)
     
-    # For now, just return a placeholder result
+    # Return combined results
     return {
         "status": "success",
         "message": "Video processed successfully",
         "video_path": video_path,
         "processing_details": {
-            "frames_processed": 100,  # placeholder
-            "duration": "00:01:30",   # placeholder
-            "resolution": "1920x1080" # placeholder
+            "frames_processed": watermark_results.get("video_info", {}).get("frame_count", 0),
+            "duration": f"{watermark_results.get('video_info', {}).get('duration_seconds', 0):.2f} seconds",
+            "resolution": "1920x1080"  # placeholder
+        },
+        "watermark_detection": {
+            "has_tiktok_watermark": watermark_results.get("has_watermark", False),
+            "detected_username": watermark_results.get("username", None)
         }
     } 

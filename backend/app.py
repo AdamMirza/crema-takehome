@@ -69,20 +69,17 @@ def login():
 @app.route('/api/process-video', methods=['POST'])
 @token_required
 def api_process_video():
-    if 'video_path' not in request.json:
-        return jsonify({'error': 'No video path provided'}), 400
+    if 'video_url' not in request.json:
+        return jsonify({'error': 'No video URL provided'}), 400
     
-    video_path = request.json['video_path']
+    video_url = request.json['video_url']
     
     try:
         # Create a temporary file to store the downloaded video
         temp_file_path = f"/tmp/{uuid.uuid4()}.mp4"
         
-        # Download from Firebase Storage using REST API
-        # Note: This requires the file to be publicly accessible or you need to implement authentication
-        storage_url = f"https://firebasestorage.googleapis.com/v0/b/{FIREBASE_CONFIG['storageBucket']}/o/{video_path.replace('/', '%2F')}?alt=media"
-        
-        response = requests.get(storage_url)
+        # Download the video from the provided URL
+        response = requests.get(video_url)
         if response.status_code != 200:
             return jsonify({'error': f'Failed to download video: {response.text}'}), 500
         

@@ -56,10 +56,25 @@ This is a secure API for processing videos stored in Firebase Storage.
 - Body:
   ```json
   {
-    "video_path": "path/to/video/in/firebase/storage.mp4"
+    "video_url": "https://firebasestorage.googleapis.com/v0/b/your-project.appspot.com/o/videos%2Fsample.mp4?alt=media&token=your-token"
   }
   ```
 - Returns processing results
+
+## Features
+
+### TikTok Watermark Detection
+
+The API includes functionality to detect TikTok watermarks in videos. This feature:
+
+- Analyzes video frames to identify TikTok logo watermarks
+- Returns whether a watermark was detected
+- Will eventually extract usernames from watermarks (placeholder for now)
+
+To use this feature, you need to:
+
+1. Create an `assets` directory in the backend folder
+2. Add a cropped image of the TikTok logo named `tiktok_logo.png` to the assets directory
 
 ## Deployment
 
