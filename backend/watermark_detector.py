@@ -1,39 +1,84 @@
 import cv2
 import numpy as np
 import os
+from debug_visualizer import DebugVisualizer
 
 class WatermarkDetector:
-    def __init__(self, use_alternative_detection=False):
-        # Path to the TikTok logo template
-        logo_path = os.path.join(os.path.dirname(__file__), "assets", "tiktok_logo.png")
+    def __init__(self, debug=False):
+        # Path to assets directory
+        self.assets_dir = os.path.join(os.path.dirname(__file__), "assets")
         
-        # Flag to enable/disable alternative detection
-        self.use_alternative_detection = use_alternative_detection
+        # Debug mode
+        self.debug = debug
+        if debug:
+            self.visualizer = DebugVisualizer()
         
-        # Check if the logo file exists
-        if os.path.exists(logo_path):
-            # Read the logo with transparency support
-            logo = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+        # Load TikTok logo components
+        self.load_templates()
+    
+    def load_templates(self):
+        """Load all template images for detection"""
+        self.templates = []
+        
+        # Try to load the main logo
+        main_logo_path = os.path.join(self.assets_dir, "tiktok_logo.png")
+        if os.path.exists(main_logo_path):
+            self.load_template(main_logo_path, "main_logo")
+        
+        # Try to load the TikTok icon (musical note)
+        icon_path = os.path.join(self.assets_dir, "tiktok_icon.png")
+        if os.path.exists(icon_path):
+            self.load_template(icon_path, "icon")
+        
+        # Try to load the TikTok text
+        text_path = os.path.join(self.assets_dir, "tiktok_text.png")
+        if os.path.exists(text_path):
+            self.load_template(text_path, "text")
+        
+        if not self.templates:
+            print("Warning: No template images found. Detection may not work properly.")
+            # Create a placeholder template
+            placeholder = np.zeros((30, 30), dtype=np.uint8)
+            self.templates.append({
+                "name": "placeholder",
+                "image": placeholder,
+                "type": "grayscale"
+            })
+    
+    def load_template(self, path, name):
+        """Load a single template image with proper handling of transparency"""
+        print(f"Loading template: {name} from {path}")
+        
+        # Read the image with transparency support
+        img = cv2.imread(path, cv2.IMREAD_UNCHANGED)
+        
+        if img is None:
+            print(f"Warning: Could not load template {name} from {path}")
+            return
+        
+        # Handle transparent PNG
+        if img.shape[2] == 4:  # Has alpha channel
+            # Extract alpha channel
+            alpha = img[:, :, 3]
+            # Convert to grayscale using just the RGB channels
+            gray = cv2.cvtColor(img[:, :, :3], cv2.COLOR_BGR2GRAY)
+            # Apply alpha mask
+            _, alpha_mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
+            gray = cv2.bitwise_and(gray, gray, mask=alpha_mask)
             
-            # Handle transparent PNG
-            if logo is not None and logo.shape[2] == 4:  # Has alpha channel
-                # Extract alpha channel
-                alpha = logo[:, :, 3]
-                # Convert to grayscale using just the RGB channels
-                self.tiktok_logo = cv2.cvtColor(logo[:, :, :3], cv2.COLOR_BGR2GRAY)
-                # Apply alpha mask
-                _, alpha_mask = cv2.threshold(alpha, 127, 255, cv2.THRESH_BINARY)
-                self.tiktok_logo = cv2.bitwise_and(self.tiktok_logo, self.tiktok_logo, mask=alpha_mask)
-            else:
-                # Regular grayscale conversion if no transparency
-                self.tiktok_logo = cv2.imread(logo_path, 0)
-            
-            print(f"Loaded logo template from {logo_path}")
+            self.templates.append({
+                "name": name,
+                "image": gray,
+                "type": "grayscale"
+            })
         else:
-            print(f"Warning: TikTok logo template not found at {logo_path}")
-            # Create a simple placeholder logo for testing
-            self.tiktok_logo = np.zeros((30, 30), dtype=np.uint8)
-            print("Using placeholder logo instead")
+            # Regular grayscale conversion if no transparency
+            gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+            self.templates.append({
+                "name": name,
+                "image": gray,
+                "type": "grayscale"
+            })
 
     def detect_tiktok_watermark(self, video_path):
         """
@@ -60,205 +105,348 @@ class WatermarkDetector:
         fps = cap.get(cv2.CAP_PROP_FPS)
         duration = frame_count / fps if fps > 0 else 0
         
-        print(f"Video info: {frame_count} frames, {fps} FPS, {duration:.2f} seconds")
+        if self.debug:
+            self.visualizer.log(f"Video info: {frame_count} frames, {fps} FPS, {duration:.2f} seconds")
+        else:
+            print(f"Video info: {frame_count} frames, {fps} FPS, {duration:.2f} seconds")
         
-        # We'll check more frames for better detection
+        # We'll check frames at regular intervals
         frames_to_check = min(30, frame_count)  # Check up to 30 frames
         interval = max(1, frame_count // frames_to_check)
         
-        print(f"Checking {frames_to_check} frames at intervals of {interval} frames")
+        # Also check specific time points where the logo might move
+        # TikTok logo often moves around 5 seconds in
+        specific_time_points = [5, 10, 15]  # seconds
+        specific_frames = [int(t * fps) for t in specific_time_points if t * fps < frame_count]
         
-        watermark_detected = False
-        username = None
+        if self.debug:
+            self.visualizer.log(f"Checking {frames_to_check} frames at intervals of {interval} frames")
+            self.visualizer.log(f"Also checking specific frames at: {specific_frames}")
+        else:
+            print(f"Checking {frames_to_check} frames at intervals of {interval} frames")
+            print(f"Also checking specific frames at: {specific_frames}")
         
+        # Track detection results
+        detection_results = []
+        best_confidence = 0
+        best_match_info = None
+        positive_frames = 0  # Count frames with positive detection
+        
+        # First, check the specific time points
+        for frame_idx in specific_frames:
+            if self.debug:
+                self.visualizer.log(f"Checking specific frame {frame_idx}/{frame_count}")
+            else:
+                print(f"Checking specific frame {frame_idx}/{frame_count}")
+            
+            # Set the frame position
+            cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
+            ret, frame = cap.read()
+            
+            if not ret:
+                continue
+            
+            # Save frame for debugging
+            if self.debug:
+                self.visualizer.save_frame(frame, f"specific", frame_idx)
+            
+            # Check for watermark in this frame
+            result = self._analyze_frame(frame, frame_idx)
+            detection_results.append(result)
+            
+            if result["detected"]:
+                positive_frames += 1
+            
+            if result["confidence"] > best_confidence:
+                best_confidence = result["confidence"]
+                best_match_info = result
+        
+        # Then check regular intervals
         for i in range(0, frame_count, interval):
-            print(f"Checking frame {i}/{frame_count}")
+            # Skip frames we've already checked
+            if i in specific_frames:
+                continue
+            
+            if self.debug:
+                self.visualizer.log(f"Checking frame {i}/{frame_count}")
+            else:
+                print(f"Checking frame {i}/{frame_count}")
+            
             # Set the frame position
             cap.set(cv2.CAP_PROP_POS_FRAMES, i)
             ret, frame = cap.read()
             
             if not ret:
-                print(f"Error reading frame {i}")
+                if self.debug:
+                    self.visualizer.log(f"Error reading frame {i}")
+                else:
+                    print(f"Error reading frame {i}")
                 break
-                
+            
+            # Save frame for debugging
+            if self.debug:
+                self.visualizer.save_frame(frame, f"original", i)
+            
             # Check for watermark in this frame
-            detected, frame_username = self._check_frame_for_watermark(frame)
+            result = self._analyze_frame(frame, i)
+            detection_results.append(result)
             
-            if detected:
-                watermark_detected = True
-                username = frame_username
-                print(f"Watermark detected in frame {i}")
+            if result["detected"]:
+                positive_frames += 1
+            
+            if result["confidence"] > best_confidence:
+                best_confidence = result["confidence"]
+                best_match_info = result
+            
+            # If we have a very confident match, we can stop early
+            if best_confidence > 0.8:
+                if self.debug:
+                    self.visualizer.log(f"Found high-confidence match ({best_confidence:.4f}), stopping early")
+                else:
+                    print(f"Found high-confidence match ({best_confidence:.4f}), stopping early")
                 break
-            
-            if i % 5 == 0:  # Save every 5th frame we check
-                debug_dir = os.path.join(os.path.dirname(__file__), "debug_frames")
-                os.makedirs(debug_dir, exist_ok=True)
-                cv2.imwrite(os.path.join(debug_dir, f"frame_{i}.jpg"), frame)
         
         # Release the video capture
         cap.release()
         
-        return {
-            "has_watermark": watermark_detected,
-            "username": username,
+        # Calculate percentage of frames with positive detection
+        detection_percentage = positive_frames / len(detection_results) if detection_results else 0
+        
+        if self.debug:
+            self.visualizer.log(f"Positive detections: {positive_frames}/{len(detection_results)} frames ({detection_percentage:.2%})")
+        else:
+            print(f"Positive detections: {positive_frames}/{len(detection_results)} frames ({detection_percentage:.2%})")
+        
+        # Determine if a watermark was detected based on all frames
+        has_watermark = False
+        
+        # More nuanced decision criteria:
+        # 1. Very high confidence match (>0.85) is enough
+        if best_confidence >= 0.85:
+            has_watermark = True
+        # 2. High confidence (>0.75) with decent detection rate (>15%)
+        elif best_confidence >= 0.75 and detection_percentage >= 0.15:
+            has_watermark = True
+        # 3. Moderate confidence (>0.7) with good detection rate (>25%)
+        elif best_confidence >= 0.7 and detection_percentage >= 0.25:
+            has_watermark = True
+        # 4. Multiple consistent detections with moderate confidence
+        elif positive_frames >= 3 and best_confidence >= 0.7:
+            has_watermark = True
+        
+        if self.debug:
+            self.visualizer.log(f"Final decision - Has watermark: {has_watermark} (Confidence: {best_confidence:.4f}, Detection rate: {detection_percentage:.2%})")
+        else:
+            print(f"Final decision - Has watermark: {has_watermark} (Confidence: {best_confidence:.4f}, Detection rate: {detection_percentage:.2%})")
+        
+        final_result = {
+            "has_watermark": has_watermark,
+            "confidence": best_confidence,
+            "detection_rate": detection_percentage,
+            "match_info": best_match_info,
             "video_info": {
                 "frame_count": frame_count,
                 "fps": fps,
                 "duration_seconds": duration
             }
         }
+        
+        # Create summary visualizations if in debug mode
+        if self.debug:
+            self.visualizer.create_summary(detection_results, final_result)
+        
+        return final_result
     
-    def _check_frame_for_watermark(self, frame):
-        """Check a single frame for TikTok watermark"""
-        # Try template matching first
-        detected, username = self._template_matching(frame)
+    def _analyze_frame(self, frame, frame_number):
+        """Analyze a single frame for TikTok watermark using template matching only"""
+        results = {
+            "frame": frame_number,
+            "template_matches": [],
+            "detected": False,
+            "confidence": 0,
+            "method": None
+        }
         
-        # If template matching didn't find anything and alternative detection is enabled, try it
-        if not detected and self.use_alternative_detection:
-            detected, username = self._alternative_watermark_detection(frame)
+        try:
+            # Try template matching with all templates
+            for template in self.templates:
+                match_result = self._template_match(frame, template)
+                
+                # Validate the match to filter out false positives
+                if match_result["detected"]:
+                    match_result = self._validate_match(frame, match_result)
+                    match_result["frame"] = frame_number  # Add frame number for debugging
+                
+                results["template_matches"].append(match_result)
+                
+                # If we found a good match, mark as detected
+                if match_result["detected"]:
+                    results["detected"] = True
+                    results["confidence"] = max(results["confidence"], match_result["confidence"])
+                    results["method"] = f"template_{template['name']}"
+                
+                # Visualize template matching if in debug mode
+                if self.debug:
+                    self.visualizer.visualize_template_match(frame, template, match_result, frame_number)
+            
+            # Visualize overall frame analysis if in debug mode
+            if self.debug:
+                self.visualizer.visualize_frame_analysis(frame, results, frame_number)
+        except Exception as e:
+            if self.debug:
+                self.visualizer.log(f"Error analyzing frame {frame_number}: {str(e)}")
         
-        return detected, username
-
-    def _template_matching(self, frame):
-        """Use template matching to find TikTok logo with multi-scale support"""
+        return results
+    
+    def _template_match(self, frame, template):
+        """Match a template against a frame with multi-scale support and preprocessing"""
+        result = {
+            "template": template["name"],
+            "detected": False,
+            "confidence": 0,
+            "location": None,
+            "scale": None,
+            "method": f"template_{template['name']}"
+        }
+        
         # Convert frame to grayscale
         gray_frame = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
         
+        # Apply preprocessing to enhance contrast
+        # This helps with detecting watermarks against complex backgrounds
+        preprocessed_frames = [
+            gray_frame,  # Original grayscale
+            cv2.equalizeHist(gray_frame),  # Histogram equalization
+            cv2.GaussianBlur(gray_frame, (3, 3), 0)  # Slight blur to reduce noise
+        ]
+        
         # Get frame dimensions for debugging
         height, width = gray_frame.shape
-        print(f"Frame dimensions: {width}x{height}")
         
         # Check if logo template exists and has valid dimensions
-        if self.tiktok_logo is None or self.tiktok_logo.shape[0] == 0 or self.tiktok_logo.shape[1] == 0:
-            print("Warning: Invalid logo template")
-            return False, None
+        if template["image"] is None or template["image"].shape[0] == 0 or template["image"].shape[1] == 0:
+            if self.debug:
+                self.visualizer.log(f"Warning: Invalid template {template['name']}")
+            return result
         
-        logo_height, logo_width = self.tiktok_logo.shape
-        print(f"Logo template dimensions: {logo_width}x{logo_height}")
+        logo_height, logo_width = template["image"].shape
         
         # Make sure logo is smaller than frame
         if logo_height >= height or logo_width >= width:
-            print("Warning: Logo template is larger than frame")
-            return False, None
+            if self.debug:
+                self.visualizer.log(f"Warning: Template {template['name']} is larger than frame")
+            return result
         
         # Try different scales for the template
-        scales = [0.5, 0.75, 1.0, 1.25, 1.5]
+        # Add more scales for finer granularity
+        scales = [0.4, 0.5, 0.6, 0.75, 0.9, 1.0, 1.1, 1.25, 1.5]
         best_match_val = 0
-        detected = False
+        best_match_loc = None
+        best_scale = None
+        best_preprocess = None
         
         try:
-            for scale in scales:
-                # Skip if scaled logo would be larger than frame
-                scaled_width = int(logo_width * scale)
-                scaled_height = int(logo_height * scale)
+            for preprocess_idx, processed_frame in enumerate(preprocessed_frames):
+                preprocess_name = ["original", "equalized", "blurred"][preprocess_idx]
                 
-                if scaled_width >= width or scaled_height >= height:
-                    continue
+                for scale in scales:
+                    # Skip if scaled logo would be larger than frame
+                    scaled_width = int(logo_width * scale)
+                    scaled_height = int(logo_height * scale)
                     
-                # Resize the logo template
-                if scale != 1.0:
-                    scaled_logo = cv2.resize(self.tiktok_logo, (scaled_width, scaled_height))
-                else:
-                    scaled_logo = self.tiktok_logo
-                
-                # Match template
-                res = cv2.matchTemplate(gray_frame, scaled_logo, cv2.TM_CCOEFF_NORMED)
-                threshold = 0.65  # Raise threshold for better precision
-                
-                min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
-                print(f"Scale {scale}: Best match confidence: {max_val:.4f} at location {max_loc}")
-                
-                if max_val > best_match_val:
-                    best_match_val = max_val
-                
-                # Check if we have matches above threshold
-                loc = np.where(res >= threshold)
-                if len(loc[0]) > 0:
-                    detected = True
-                    print(f"Detected {len(loc[0])} matches at scale {scale} (confidence: {max_val:.4f})")
+                    if scaled_width >= width or scaled_height >= height:
+                        continue
+                        
+                    # Resize the logo template
+                    if scale != 1.0:
+                        scaled_logo = cv2.resize(template["image"], (scaled_width, scaled_height))
+                    else:
+                        scaled_logo = template["image"]
                     
-                    # Save a debug image showing the match
-                    debug_dir = os.path.join(os.path.dirname(__file__), "debug_frames")
-                    os.makedirs(debug_dir, exist_ok=True)
+                    # Match template
+                    res = cv2.matchTemplate(processed_frame, scaled_logo, cv2.TM_CCOEFF_NORMED)
+                    threshold = 0.7  # Slightly lower threshold to catch more potential matches
                     
-                    # Draw rectangle around the best match
-                    debug_frame = frame.copy()
-                    top_left = max_loc
-                    bottom_right = (top_left[0] + scaled_width, top_left[1] + scaled_height)
-                    cv2.rectangle(debug_frame, top_left, bottom_right, (0, 255, 0), 2)
+                    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(res)
                     
-                    cv2.imwrite(os.path.join(debug_dir, f"match_scale_{scale}.jpg"), debug_frame)
-                    break
+                    if self.debug and max_val > 0.5:  # Only log significant matches
+                        self.visualizer.log(f"Preprocess: {preprocess_name}, Scale {scale}: Match confidence: {max_val:.4f} at location {max_loc}")
+                    
+                    if max_val > best_match_val:
+                        best_match_val = max_val
+                        best_match_loc = max_loc
+                        best_scale = scale
+                        best_preprocess = preprocess_name
             
-            print(f"Best overall match confidence: {best_match_val:.4f}")
+            # Determine if we have a match
+            result["confidence"] = best_match_val
             
-            username = None
-            if detected:
-                username = "tiktok_user"  # Placeholder
+            if best_match_val >= threshold:
+                result["detected"] = True
+                result["location"] = best_match_loc
+                result["scale"] = best_scale
+                
+                if self.debug:
+                    self.visualizer.log(f"Template {template['name']} matched with confidence {best_match_val:.4f} at scale {best_scale} using {best_preprocess} preprocessing")
             
-            return detected, username
+            return result
         except Exception as e:
-            print(f"Error in template matching: {str(e)}")
-            return False, None
+            if self.debug:
+                self.visualizer.log(f"Error in template matching: {str(e)}")
+            return result
 
-    def _alternative_watermark_detection(self, frame):
-        """Alternative method to detect TikTok watermarks based on image characteristics"""
-        # Convert to HSV for better color segmentation
-        hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    def _validate_match(self, frame, match_result):
+        """Validate a template match to filter out false positives"""
+        if not match_result["detected"] or match_result["location"] is None:
+            return match_result
         
-        # TikTok watermarks are usually white text on a semi-transparent background
-        # Let's look for bright regions in the bottom right corner
-        height, width = frame.shape[:2]
+        # Get the location and scale of the matched template
+        x, y = match_result["location"]
+        scale = match_result["scale"] or 1.0
+        template_name = match_result["template"]
         
-        # Define region of interest (bottom right corner)
-        roi_x = int(width * 0.7)
-        roi_y = int(height * 0.7)
-        roi = frame[roi_y:height, roi_x:width]
+        # Find the template by name
+        template_idx = next((i for i, t in enumerate(self.templates) if t["name"] == template_name), None)
+        if template_idx is None:
+            return match_result
+        
+        template = self.templates[template_idx]
+        logo_height, logo_width = template["image"].shape
+        scaled_height = int(logo_height * scale)
+        scaled_width = int(logo_width * scale)
+        
+        # Extract the region where the match was found
+        roi_x = max(0, x)
+        roi_y = max(0, y)
+        roi_width = min(frame.shape[1] - roi_x, scaled_width)
+        roi_height = min(frame.shape[0] - roi_y, scaled_height)
+        
+        # Make sure we have a valid ROI
+        if roi_width <= 0 or roi_height <= 0:
+            match_result["detected"] = False
+            match_result["confidence"] *= 0.5
+            return match_result
+        
+        # Extract the ROI
+        roi = frame[roi_y:roi_y+roi_height, roi_x:roi_x+roi_width]
+        
+        # Convert to HSV for better color analysis
+        hsv_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
+        
+        # Calculate average saturation and value
+        avg_s = np.mean(hsv_roi[:, :, 1])
+        avg_v = np.mean(hsv_roi[:, :, 2])
+        
+        # TikTok watermarks typically have moderate to high brightness
+        # and low to moderate saturation
+        if avg_v < 50:  # Very dark region
+            match_result["detected"] = False
+            match_result["confidence"] *= 0.7
+            if self.debug:
+                self.visualizer.log(f"Match rejected: Too dark (V={avg_v:.1f})")
         
         # Save ROI for debugging
-        debug_dir = os.path.join(os.path.dirname(__file__), "debug_frames")
-        os.makedirs(debug_dir, exist_ok=True)
-        cv2.imwrite(os.path.join(debug_dir, "roi.jpg"), roi)
+        if self.debug:
+            self.visualizer.save_frame(roi, f"validation_roi", match_result.get("frame", 0))
         
-        # Convert ROI to grayscale
-        gray_roi = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-        
-        # Apply threshold to find bright regions
-        _, thresh = cv2.threshold(gray_roi, 200, 255, cv2.THRESH_BINARY)
-        
-        # Save thresholded image for debugging
-        cv2.imwrite(os.path.join(debug_dir, "roi_thresh.jpg"), thresh)
-        
-        # Count white pixels
-        white_pixel_count = np.sum(thresh == 255)
-        white_pixel_percentage = white_pixel_count / (thresh.shape[0] * thresh.shape[1])
-        
-        print(f"White pixel percentage in ROI: {white_pixel_percentage:.4f}")
-        
-        # TikTok watermarks typically have a very specific pattern
-        # We need to be more strict with our detection
-        
-        # More strict criteria for TikTok watermark:
-        # 1. White pixel percentage should be in a specific range
-        # 2. The white pixels should form a specific pattern (e.g., text-like)
-        
-        # For now, let's just make the threshold range more strict
-        if 0.08 < white_pixel_percentage < 0.25:
-            # Additional check: Look for text-like patterns
-            # This is a simple check for horizontal alignment of white pixels
-            
-            # Get horizontal projection (sum of white pixels in each row)
-            h_projection = np.sum(thresh == 255, axis=1)
-            
-            # Count rows with significant white pixels
-            significant_rows = np.sum(h_projection > (thresh.shape[1] * 0.1))
-            
-            # TikTok watermark text typically spans multiple rows
-            if significant_rows >= 3:
-                print("Potential watermark detected using alternative method")
-                print(f"Significant rows: {significant_rows}")
-                return True, "tiktok_user"
-            else:
-                print(f"Not enough significant rows: {significant_rows}")
-        
-        return False, None 
+        return match_result 

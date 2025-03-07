@@ -28,6 +28,8 @@ def process_video(video_path):
         },
         "watermark_detection": {
             "has_tiktok_watermark": watermark_results.get("has_watermark", False),
+            "confidence": watermark_results.get("confidence", 0),
+            "detection_rate": watermark_results.get("detection_rate", 0),
             "detected_username": watermark_results.get("username", None)
         }
     } 
