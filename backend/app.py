@@ -3,12 +3,10 @@ from flask_cors import CORS
 import os
 import uuid
 import requests
-from functools import wraps
-import jwt
-from datetime import datetime, timedelta
+import tempfile
+from watermark_remover import TikTokWatermarkRemover
+import cv2
 from dotenv import load_dotenv
-from video_processor import process_video
-from watermark_remover import WatermarkRemover
 
 # Load environment variables from .env file
 load_dotenv()
@@ -21,54 +19,12 @@ FIREBASE_CONFIG = {
     "apiKey": os.environ.get("FIREBASE_API_KEY", ""),
     "authDomain": os.environ.get("FIREBASE_AUTH_DOMAIN", "crema-takehome.firebaseapp.com"),
     "projectId": os.environ.get("FIREBASE_PROJECT_ID", "crema-takehome"),
-    "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET", "crema-takehome.firebasestorage.app"),
+    "storageBucket": os.environ.get("FIREBASE_STORAGE_BUCKET", "crema-takehome.appspot.com"),
     "messagingSenderId": os.environ.get("FIREBASE_MESSAGING_SENDER_ID", "561553746659"),
     "appId": os.environ.get("FIREBASE_APP_ID", "1:561553746659:web:4907152bdd320c1ae7f3d6")
 }
 
-# Secret key for JWT
-SECRET_KEY = os.environ.get('JWT_SECRET_KEY', 'your-secret-key-for-development')
-
-# Authentication decorator
-def token_required(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        token = None
-        
-        if 'Authorization' in request.headers:
-            auth_header = request.headers['Authorization']
-            if auth_header.startswith('Bearer '):
-                token = auth_header.split(' ')[1]
-        
-        if not token:
-            return jsonify({'message': 'Token is missing!'}), 401
-        
-        try:
-            data = jwt.decode(token, SECRET_KEY, algorithms=["HS256"])
-            # You can add user verification here if needed
-        except:
-            return jsonify({'message': 'Token is invalid!'}), 401
-        
-        return f(*args, **kwargs)
-    
-    return decorated
-
-@app.route('/api/login', methods=['POST'])
-def login():
-    # This is a simple example. In production, verify credentials against a database
-    auth = request.authorization
-    if auth and auth.username == 'admin' and auth.password == 'password':
-        token = jwt.encode({
-            'user': auth.username,
-            'exp': datetime.utcnow() + timedelta(hours=24)
-        }, SECRET_KEY)
-        
-        return jsonify({'token': token})
-    
-    return jsonify({'message': 'Could not verify!'}), 401
-
 @app.route('/api/process-video', methods=['POST'])
-@token_required
 def api_process_video():
     if 'video_url' not in request.json:
         return jsonify({'error': 'No video URL provided'}), 400
@@ -76,28 +32,61 @@ def api_process_video():
     video_url = request.json['video_url']
     
     try:
-        # Create a temporary file to store the downloaded video
-        temp_file_path = f"/tmp/{uuid.uuid4()}.mp4"
+        # Create temporary files for processing
+        temp_input = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
+        temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         
-        # Download the video from the provided URL
+        # Download the video
         response = requests.get(video_url)
         if response.status_code != 200:
             return jsonify({'error': f'Failed to download video: {response.text}'}), 500
         
-        # Save the downloaded content to a temporary file
-        with open(temp_file_path, 'wb') as f:
+        with open(temp_input, 'wb') as f:
             f.write(response.content)
         
-        # Process the video
-        result = process_video(temp_file_path)
+        # Initialize watermark remover in debug mode to check for TikTok watermarks
+        remover = TikTokWatermarkRemover(debug=True)
         
-        # Clean up the temporary file
-        if os.path.exists(temp_file_path):
-            os.remove(temp_file_path)
+        # First, analyze the video to detect if it's a TikTok video
+        cap = cv2.VideoCapture(temp_input)
+        if not cap.isOpened():
+            return jsonify({'error': 'Could not open video file'}), 500
+            
+        # Get first 5 seconds of frames
+        fps = cap.get(cv2.CAP_PROP_FPS)
+        first_section_frames = min(int(5 * fps), int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         
-        return jsonify({'result': result})
-    
+        # Analyze first section for TikTok watermarks
+        first_section_elements = remover._analyze_section(cap, 0, first_section_frames, "first_section")
+        cap.release()
+        
+        # If no TikTok watermarks detected, return original video
+        if not first_section_elements or not any(key in first_section_elements for key in ['logo', 'logo_text']):
+            os.unlink(temp_input)
+            os.unlink(temp_output)
+            return jsonify({
+                'message': 'No TikTok watermarks detected',
+                'video_url': video_url  # Return original URL
+            })
+        
+        # Process video to remove watermarks
+        print("TikTok watermarks detected, processing video...")
+        remover.process_video(temp_input, temp_output)
+        
+        # Return the processed video URL (this will be the Firebase Storage URL from frontend)
+        return jsonify({
+            'message': 'Video processed successfully',
+            'original_url': video_url,
+            'processed_url': video_url  # Frontend will handle the Firebase upload
+        })
+        
     except Exception as e:
+        # Clean up temporary files in case of error
+        if 'temp_input' in locals() and os.path.exists(temp_input):
+            os.unlink(temp_input)
+        if 'temp_output' in locals() and os.path.exists(temp_output):
+            os.unlink(temp_output)
+        
         return jsonify({'error': str(e)}), 500
 
 @app.route('/api/remove-watermark', methods=['POST'])

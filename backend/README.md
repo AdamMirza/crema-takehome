@@ -42,12 +42,6 @@ This is a secure API for processing videos stored in Firebase Storage.
 
 ## API Endpoints
 
-### Authentication
-
-**POST /api/login**
-- Basic authentication required
-- Returns a JWT token for API access
-
 ### Video Processing
 
 **POST /api/process-video**
@@ -60,6 +54,20 @@ This is a secure API for processing videos stored in Firebase Storage.
   }
   ```
 - Returns processing results
+   ```json
+   {
+      "message": "Video processed successfully",
+      "original_url": "https://example.com/video.mp4",
+      "processed_url": "https://storage.googleapis.com/crema-takehome.appspot.com/processed_videos/..."
+   }
+   ```
+
+   ```json
+   {
+      "message": "No TikTok watermarks detected",
+      "video_url": "https://example.com/video.mp4"
+   }
+   ```
 
 ## Features
 
