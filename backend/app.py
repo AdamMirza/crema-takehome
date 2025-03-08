@@ -8,6 +8,7 @@ import jwt
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from video_processor import process_video
+from watermark_remover import WatermarkRemover
 
 # Load environment variables from .env file
 load_dotenv()
@@ -98,6 +99,71 @@ def api_process_video():
     
     except Exception as e:
         return jsonify({'error': str(e)}), 500
+
+@app.route('/api/remove-watermark', methods=['POST'])
+def remove_watermark():
+    """
+    Remove TikTok watermark from a video.
+    
+    Request body:
+    {
+        "video_url": "URL of the video to process"
+    }
+    
+    Returns:
+    {
+        "success": true/false,
+        "message": "Status message",
+        "video_url": "URL of the processed video" (if successful)
+    }
+    """
+    try:
+        # Get the video URL from the request
+        data = request.get_json()
+        video_url = data.get('video_url')
+        
+        if not video_url:
+            return jsonify({
+                'success': False,
+                'message': 'No video URL provided'
+            }), 400
+        
+        # Download the video
+        video_path = download_video(video_url)
+        
+        if not video_path:
+            return jsonify({
+                'success': False,
+                'message': 'Failed to download video'
+            }), 400
+        
+        # Generate output path
+        output_filename = f"processed_{os.path.basename(video_path)}"
+        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        
+        # Remove the watermark
+        remover = WatermarkRemover(inpainting_method='opencv')
+        result = remover.remove_watermark(video_path, output_path)
+        
+        if not result['success']:
+            return jsonify({
+                'success': False,
+                'message': result['message']
+            }), 400
+        
+        # Generate URL for the processed video
+        video_url = url_for('static', filename=f'uploads/{output_filename}', _external=True)
+        
+        return jsonify({
+            'success': True,
+            'message': 'Watermark removed successfully',
+            'video_url': video_url
+        })
+    except Exception as e:
+        return jsonify({
+            'success': False,
+            'message': f'Error: {str(e)}'
+        }), 500
 
 if __name__ == '__main__':
     app.run(debug=True) 
