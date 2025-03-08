@@ -425,7 +425,8 @@ class WatermarkDetector:
         if roi_width <= 0 or roi_height <= 0:
             match_result["detected"] = False
             match_result["confidence"] *= 0.5
-            return match_result
+            if self.debug:
+                self.visualizer.log(f"Match rejected: Too dark (V={avg_v:.1f})")
         
         # Extract the ROI
         roi = frame[roi_y:roi_y+roi_height, roi_x:roi_x+roi_width]
@@ -449,4 +450,16 @@ class WatermarkDetector:
         if self.debug:
             self.visualizer.save_frame(roi, f"validation_roi", match_result.get("frame", 0))
         
-        return match_result 
+        return match_result
+
+    def detect_tiktok_watermark_in_frame(self, frame):
+        """
+        Detect TikTok watermark in a single frame.
+        
+        Args:
+            frame: The frame to analyze
+            
+        Returns:
+            dict: Results of the watermark detection for this frame
+        """
+        return self._analyze_frame(frame, 0) 
