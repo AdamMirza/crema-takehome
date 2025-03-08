@@ -149,61 +149,106 @@ class TikTokWatermarkRemover:
             
         # Get logo position
         logo_x, logo_y, logo_w, logo_h = logo_box
-        
-        # Define search region near logo
-        search_margin = 50  # Pixels to search around logo
         height, width = frame.shape[:2]
         
-        # Define search area based on logo position
-        search_x = max(0, logo_x - search_margin)
-        search_y = max(0, logo_y - search_margin)
-        search_w = min(width - search_x, logo_w + 2 * search_margin)
-        search_h = min(height - search_y, logo_h + 2 * search_margin)
+        # Define two search regions: below and to the right of logo
+        search_regions = [
+            # Below logo
+            {
+                'x': max(0, logo_x - int(logo_w * 0.25)),
+                'y': logo_y + logo_h,
+                'w': min(width - logo_x, int(logo_w * 2)),
+                'h': int(logo_h * 1.5),
+                'weight': 1.2  # Prefer text below logo
+            },
+            # Right of logo
+            {
+                'x': logo_x + logo_w,
+                'y': max(0, logo_y - int(logo_h * 0.25)),
+                'w': min(width - (logo_x + logo_w), int(logo_w * 2)),
+                'h': int(logo_h * 1.5),
+                'weight': 1.0  # Normal weight for text to the right
+            }
+        ]
         
-        # Extract region of interest
-        roi = frame[search_y:search_y+search_h, search_x:search_x+search_w]
+        best_text_box = None
+        best_confidence = 0
         
-        # Convert to HSV for better white text detection
-        hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
-        
-        # Define range for white color
-        lower_white = np.array([0, 0, 200])
-        upper_white = np.array([180, 30, 255])
-        
-        # Create mask for white regions
-        mask = cv2.inRange(hsv, lower_white, upper_white)
-        
-        # Apply morphological operations to connect text
-        kernel = np.ones((3,3), np.uint8)
-        mask = cv2.dilate(mask, kernel, iterations=2)
-        mask = cv2.erode(mask, kernel, iterations=1)
-        
-        # Find contours
-        contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if not contours:
-            return None
+        for region in search_regions:
+            # Skip if region is out of bounds
+            if region['x'] + region['w'] > width or region['y'] + region['h'] > height:
+                continue
+                
+            # Extract region of interest
+            roi = frame[region['y']:region['y']+region['h'], 
+                      region['x']:region['x']+region['w']]
             
-        # Filter and sort contours by area
-        valid_contours = []
-        for cnt in contours:
-            x, y, w, h = cv2.boundingRect(cnt)
-            area = cv2.contourArea(cnt)
-            aspect_ratio = w / float(h) if h > 0 else 0
+            # Convert to HSV for better white text detection
+            hsv = cv2.cvtColor(roi, cv2.COLOR_BGR2HSV)
             
-            # Filter based on size and aspect ratio
-            if area > 100 and 2 < aspect_ratio < 8:
-                valid_contours.append(cnt)
+            # Define range for white color
+            lower_white = np.array([0, 0, 180])
+            upper_white = np.array([180, 30, 255])
+            
+            # Create mask for white regions
+            mask = cv2.inRange(hsv, lower_white, upper_white)
+            
+            # Apply morphological operations
+            kernel = np.ones((3,3), np.uint8)
+            mask = cv2.dilate(mask, kernel, iterations=2)
+            mask = cv2.erode(mask, kernel, iterations=1)
+            
+            if self.debug:
+                self._save_debug_frame(mask, f"text_mask_{region['y']}", None)
+            
+            # Find contours
+            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+            
+            if not contours:
+                continue
+                
+            # Filter and sort contours
+            valid_contours = []
+            for cnt in contours:
+                x, y, w, h = cv2.boundingRect(cnt)
+                area = cv2.contourArea(cnt)
+                aspect_ratio = w / float(h) if h > 0 else 0
+                
+                # Filter based on size and aspect ratio
+                if area > 100 and 2 < aspect_ratio < 8:
+                    # Calculate relative position score (prefer left-aligned text)
+                    position_score = 1.0 - (x / float(region['w']))
+                    confidence = (area / (region['w'] * region['h'])) * position_score * region['weight']
+                    valid_contours.append((cnt, x, y, w, h, confidence))
+            
+            if not valid_contours:
+                continue
+            
+            # Get the contour with highest confidence
+            best_contour = max(valid_contours, key=lambda x: x[5])
+            _, x, y, w, h, confidence = best_contour
+            
+            # Convert coordinates back to full frame
+            text_box = [
+                x + region['x'],
+                y + region['y'],
+                w,
+                h
+            ]
+            
+            if confidence > best_confidence:
+                best_confidence = confidence
+                best_text_box = text_box
         
-        if not valid_contours:
-            return None
+        if self.debug and best_text_box is not None:
+            debug_frame = frame.copy()
+            x, y, w, h = best_text_box
+            cv2.rectangle(debug_frame, (x, y), (x+w, y+h), (255, 0, 0), 2)
+            cv2.putText(debug_frame, f"text_conf:{best_confidence:.2f}", (x, y-5),
+                      cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255, 0, 0), 2)
+            self._save_debug_frame(debug_frame, "text_detection_debug", None)
         
-        # Find the largest valid contour
-        largest_contour = max(valid_contours, key=cv2.contourArea)
-        x, y, w, h = cv2.boundingRect(largest_contour)
-        
-        # Convert coordinates back to full frame
-        return [x + search_x, y + search_y, w, h]
+        return best_text_box
 
     def _detect_username_below_text(self, frame, logo_text_box):
         """Detect TikTok username below the logo text box"""
@@ -307,8 +352,8 @@ class TikTokWatermarkRemover:
             print(f"Analyzing {frames_to_analyze} frames with step {frame_step}")
         
         detections = []
-        best_logo_text_detection = None
-        best_logo_text_conf = 0
+        best_detection = None
+        best_confidence = 0
         best_frame = None
         
         for i in range(frames_to_analyze):
@@ -333,19 +378,21 @@ class TikTokWatermarkRemover:
                     }
                 }
                 
-                # Store best logo_text detection
-                if match['type'] == 'logo_text' and match['confidence'] > best_logo_text_conf:
-                    best_logo_text_conf = match['confidence']
-                    best_logo_text_detection = detection.copy()
-                    best_frame = frame.copy()
-                    
+                # If we found logo_text, look for username
+                if match['type'] == 'logo_text':
                     # Look for username below logo text
                     username_box = self._detect_username_below_text(frame, detection['logo_text']['box'])
                     if username_box:
-                        best_logo_text_detection['username'] = {
+                        detection['username'] = {
                             'box': username_box,
                             'confidence': 1.0
                         }
+                    
+                    # Update best detection if this has higher confidence
+                    if match['confidence'] > best_confidence:
+                        best_confidence = match['confidence']
+                        best_detection = detection.copy()
+                        best_frame = frame.copy()
                 
                 detections.append(detection)
                 
@@ -372,10 +419,10 @@ class TikTokWatermarkRemover:
                 print(f"No detections found in {section_name}")
             return {}
         
-        # Save best frame with all detections if we found logo_text
-        if self.debug and best_frame is not None and best_logo_text_detection is not None:
+        # Save best frame with all detections
+        if self.debug and best_frame is not None and best_detection is not None:
             debug_frame = best_frame.copy()
-            for element_type, element_data in best_logo_text_detection.items():
+            for element_type, element_data in best_detection.items():
                 x, y, w, h = element_data['box']
                 color = {
                     'logo': (0, 255, 0),
@@ -398,11 +445,10 @@ class TikTokWatermarkRemover:
                    element_data['confidence'] > combined_detection[element_type]['confidence']:
                     combined_detection[element_type] = element_data
         
-        # Add the best logo_text detection and its username if found
-        if best_logo_text_detection:
-            combined_detection['logo_text'] = best_logo_text_detection['logo_text']
-            if 'username' in best_logo_text_detection:
-                combined_detection['username'] = best_logo_text_detection['username']
+        # Add the best detection and its username if found
+        if best_detection:
+            for element_type, element_data in best_detection.items():
+                combined_detection[element_type] = element_data
         
         if self.debug:
             print(f"\nFinal detections for {section_name}:")
