@@ -76,7 +76,7 @@ class TikTokWatermarkRemover:
         
         return templates
 
-    def _detect_watermark(self, frame):
+    def _detect_watermark(self, frame, section_name="first"):
         """Detect TikTok watermark in a frame using template matching"""
         if not self.templates:
             return None
@@ -117,15 +117,21 @@ class TikTokWatermarkRemover:
                         'scale': scale
                     }
         
+        # Adjust threshold for logo_text in middle section
+        threshold_adjustment = 0.1 if section_name == "middle_section" and \
+                            any(m['type'] == 'logo_text' for m in best_matches.values()) else 0
+        
         # Filter matches by their specific confidence thresholds
-        valid_matches = {
-            k: v for k, v in best_matches.items() 
-            for template in self.templates 
-            if template['name'] == k and v['confidence'] > template['threshold']
-        }
+        valid_matches = {}
+        for template in self.templates:
+            for k, v in best_matches.items():
+                if template['name'] == k:
+                    adjusted_threshold = template['threshold'] - threshold_adjustment
+                    if v['confidence'] > adjusted_threshold:
+                        valid_matches[k] = v
         
         if self.debug and valid_matches:
-            print("\nValid matches found:")
+            print(f"\nValid matches found in {section_name}:")
             for match_type, match_data in valid_matches.items():
                 print(f"{match_type}: confidence={match_data['confidence']:.3f}, scale={match_data['scale']:.2f}")
         
@@ -292,10 +298,19 @@ class TikTokWatermarkRemover:
 
     def _analyze_section(self, cap, start_frame: int, num_frames: int, section_name: str) -> Dict:
         """Analyze a section of frames for watermark detection."""
-        frames_to_analyze = min(10, num_frames)
+        frames_to_analyze = min(20, num_frames)  # Increased from 10 to 20
         frame_step = max(1, num_frames // frames_to_analyze)
         
+        if self.debug:
+            print(f"\nAnalyzing {section_name}:")
+            print(f"Starting at frame {start_frame}")
+            print(f"Analyzing {frames_to_analyze} frames with step {frame_step}")
+        
         detections = []
+        best_logo_text_detection = None
+        best_logo_text_conf = 0
+        best_frame = None
+        
         for i in range(frames_to_analyze):
             frame_idx = start_frame + (i * frame_step)
             cap.set(cv2.CAP_PROP_POS_FRAMES, frame_idx)
@@ -303,8 +318,8 @@ class TikTokWatermarkRemover:
             if not ret:
                 continue
             
-            # Detect watermarks
-            match = self._detect_watermark(frame)
+            # Detect watermarks with section name
+            match = self._detect_watermark(frame, section_name)
             if match:
                 detection = {
                     match['type']: {
@@ -318,13 +333,18 @@ class TikTokWatermarkRemover:
                     }
                 }
                 
-                # If we found logo_text, look for username below it
-                if match['type'] == 'logo_text':
+                # Store best logo_text detection
+                if match['type'] == 'logo_text' and match['confidence'] > best_logo_text_conf:
+                    best_logo_text_conf = match['confidence']
+                    best_logo_text_detection = detection.copy()
+                    best_frame = frame.copy()
+                    
+                    # Look for username below logo text
                     username_box = self._detect_username_below_text(frame, detection['logo_text']['box'])
                     if username_box:
-                        detection['username'] = {
+                        best_logo_text_detection['username'] = {
                             'box': username_box,
-                            'confidence': 1.0  # Simplified confidence for username
+                            'confidence': 1.0
                         }
                 
                 detections.append(detection)
@@ -342,13 +362,33 @@ class TikTokWatermarkRemover:
                         }.get(element_type, (0, 255, 0))
                         
                         cv2.rectangle(debug_frame, (x, y), (x+w, y+h), color, 2)
-                        cv2.putText(debug_frame, element_type, (x, y-5), 
-                                  cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+                        cv2.putText(debug_frame, f"{element_type} ({element_data['confidence']:.2f})", 
+                                  (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
                     
                     self._save_debug_frame(debug_frame, f"{section_name}_detection", i)
         
         if not detections:
+            if self.debug:
+                print(f"No detections found in {section_name}")
             return {}
+        
+        # Save best frame with all detections if we found logo_text
+        if self.debug and best_frame is not None and best_logo_text_detection is not None:
+            debug_frame = best_frame.copy()
+            for element_type, element_data in best_logo_text_detection.items():
+                x, y, w, h = element_data['box']
+                color = {
+                    'logo': (0, 255, 0),
+                    'icon': (0, 255, 255),
+                    'logo_text': (255, 0, 0),
+                    'username': (255, 165, 0)
+                }.get(element_type, (0, 255, 0))
+                
+                cv2.rectangle(debug_frame, (x, y), (x+w, y+h), color, 2)
+                cv2.putText(debug_frame, f"{element_type} ({element_data['confidence']:.2f})", 
+                          (x, y-5), cv2.FONT_HERSHEY_SIMPLEX, 0.7, color, 2)
+            
+            self._save_debug_frame(debug_frame, f"{section_name}_best_detection", None)
         
         # Combine all unique detections with highest confidence
         combined_detection = {}
@@ -357,6 +397,17 @@ class TikTokWatermarkRemover:
                 if element_type not in combined_detection or \
                    element_data['confidence'] > combined_detection[element_type]['confidence']:
                     combined_detection[element_type] = element_data
+        
+        # Add the best logo_text detection and its username if found
+        if best_logo_text_detection:
+            combined_detection['logo_text'] = best_logo_text_detection['logo_text']
+            if 'username' in best_logo_text_detection:
+                combined_detection['username'] = best_logo_text_detection['username']
+        
+        if self.debug:
+            print(f"\nFinal detections for {section_name}:")
+            for element_type, element_data in combined_detection.items():
+                print(f"{element_type}: confidence={element_data['confidence']:.3f}")
         
         # Convert to the expected format
         result = {}
@@ -384,15 +435,26 @@ class TikTokWatermarkRemover:
         print(f"Video properties: {width}x{height}, {fps} fps, {total_frames} frames")
         
         # Calculate frame ranges
-        first_section_frames = min(int(5 * fps), total_frames // 3)  # First 5 seconds
-        last_section_start = max(total_frames - int(fps), 2 * first_section_frames)  # Last 1 second
+        first_section_frames = min(int(5 * fps), total_frames)  # Exactly 5 seconds or whole video if shorter
+        middle_section_start = first_section_frames  # Start middle section right after first section
+        middle_section_end = total_frames - int(fps)  # End 1 second before video ends
+        
+        if self.debug:
+            print(f"Frame ranges:")
+            print(f"First section: 0 to {first_section_frames} ({first_section_frames/fps:.2f} seconds)")
+            print(f"Middle section: {middle_section_start} to {middle_section_end} ({(middle_section_end-middle_section_start)/fps:.2f} seconds)")
         
         # Analyze sections using the watermark detector
         print("Analyzing first 5 seconds of the video...")
         first_section_elements = self._analyze_section(cap, 0, first_section_frames, "first_section")
         
         print("Analyzing middle section of the video...")
-        middle_section_elements = self._analyze_section(cap, first_section_frames, last_section_start - first_section_frames, "middle_section")
+        middle_section_elements = self._analyze_section(
+            cap, 
+            middle_section_start,
+            middle_section_end - middle_section_start,
+            "middle_section"
+        )
         
         # Process frames
         return self._process_frames(
@@ -400,7 +462,7 @@ class TikTokWatermarkRemover:
             first_section_elements,
             middle_section_elements,
             first_section_frames,
-            last_section_start,
+            middle_section_end,
             total_frames
         )
     
