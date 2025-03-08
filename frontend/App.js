@@ -4,16 +4,8 @@ import { Video } from 'expo-av';
 import * as ImagePicker from 'expo-image-picker';
 import { initializeApp } from 'firebase/app';
 import { getStorage, ref, uploadBytesResumable, getDownloadURL } from 'firebase/storage';
-
-// Firebase configuration
-const firebaseConfig = {
-  apiKey: "AIzaSyDQKPtaRvNxpBp-YWzgcVjxnNOVA_sEOwE",
-  authDomain: "crema-takehome.firebaseapp.com",
-  projectId: "crema-takehome",
-  storageBucket: "crema-takehome.appspot.com",
-  messagingSenderId: "561553746659",
-  appId: "1:561553746659:web:4907152bdd320c1ae7f3d6"
-};
+import EventSource from 'react-native-sse';
+import { firebaseConfig } from './config/firebase';
 
 // Initialize Firebase
 const app = initializeApp(firebaseConfig);
@@ -35,7 +27,7 @@ export default function App() {
       }
 
       const result = await ImagePicker.launchImageLibraryAsync({
-        mediaTypes: ImagePicker.MediaTypeOptions.Videos,
+        mediaTypes: ["videos"],
         allowsEditing: true,
         quality: 1,
       });
@@ -53,34 +45,34 @@ export default function App() {
   };
 
   const listenToProgress = (taskId) => {
-    const eventSource = new EventSource(`http://localhost:5000/api/progress/${taskId}`);
+    const es = new EventSource(`http://localhost:5000/api/progress/${taskId}`);
     
-    eventSource.onmessage = (event) => {
+    es.addEventListener('message', (event) => {
       const data = JSON.parse(event.data);
       console.log('Progress update:', data);
       
       if (data.status === 'complete') {
         setProgress(null);
         setProcessedVideo({ uri: data.video_url });
-        eventSource.close();
+        es.close();
       } else if (data.status === 'error') {
         setError(data.message);
         setProgress(null);
-        eventSource.close();
+        es.close();
       } else {
         setProgress({
           status: data.status,
           value: data.progress / 100
         });
       }
-    };
+    });
 
-    eventSource.onerror = (error) => {
+    es.addEventListener('error', (error) => {
       console.error('SSE Error:', error);
       setError('Lost connection to server');
       setProgress(null);
-      eventSource.close();
-    };
+      es.close();
+    });
   };
 
   const uploadAndProcessVideo = async () => {
@@ -92,53 +84,61 @@ export default function App() {
 
     try {
       // First, upload to Firebase Storage
+      console.log('Starting video upload process...');
+      console.log('Video URI:', video.uri);
+      
       const response = await fetch(video.uri);
       const blob = await response.blob();
+      console.log('Blob size:', blob.size);
       
-      const filename = `uploads/${Date.now()}.mp4`;
+      // Create a unique filename with timestamp and random string
+      const timestamp = Date.now();
+      const randomString = Math.random().toString(36).substring(2, 8);
+      const filename = `originals/${timestamp}-${randomString}.mp4`;
+      console.log('Target filename:', filename);
+      
+      // Create storage reference
       const storageRef = ref(storage, filename);
       
-      // Upload the video
-      const uploadTask = uploadBytesResumable(storageRef, blob);
-      
-      // Wait for upload to complete
-      await new Promise((resolve, reject) => {
-        uploadTask.on(
-          'state_changed',
-          (snapshot) => {
-            const progress = (snapshot.bytesTransferred / snapshot.totalBytes);
-            setProgress({
-              status: 'uploading',
-              value: progress
-            });
+      try {
+        // Upload the video directly first
+        const result = await uploadBytesResumable(storageRef, blob, {
+          contentType: 'video/mp4',
+        });
+        
+        console.log('Upload successful:', result);
+        
+        // Get the download URL
+        const downloadURL = await getDownloadURL(result.ref);
+        console.log('Download URL:', downloadURL);
+
+        // Start processing
+        const processResponse = await fetch('http://localhost:5000/api/process-video', {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
           },
-          reject,
-          resolve
-        );
-      });
+          body: JSON.stringify({
+            video_url: downloadURL,
+          }),
+        });
 
-      // Get the download URL
-      const downloadURL = await getDownloadURL(storageRef);
+        const data = await processResponse.json();
+        
+        if (!processResponse.ok) {
+          throw new Error(data.error || 'Failed to process video');
+        }
 
-      // Start processing
-      const processResponse = await fetch('http://localhost:5000/api/process-video', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-        },
-        body: JSON.stringify({
-          video_url: downloadURL,
-        }),
-      });
-
-      const data = await processResponse.json();
-      
-      if (!processResponse.ok) {
-        throw new Error(data.error || 'Failed to process video');
+        // Listen for progress updates
+        listenToProgress(data.task_id);
+        
+      } catch (uploadError) {
+        console.error('Detailed upload error:', uploadError);
+        console.error('Error code:', uploadError.code);
+        console.error('Error message:', uploadError.message);
+        console.error('Error details:', uploadError.serverResponse);
+        throw new Error(`Upload failed: ${uploadError.message}`);
       }
-
-      // Listen for progress updates
-      listenToProgress(data.task_id);
       
     } catch (err) {
       console.error("Error processing video:", err);

@@ -1,4 +1,4 @@
-from flask import Flask, request, jsonify
+from flask import Flask, request, jsonify, Response
 from flask_cors import CORS
 import os
 import uuid
@@ -7,6 +7,10 @@ import tempfile
 from watermark_remover import TikTokWatermarkRemover
 import cv2
 from dotenv import load_dotenv
+import json
+import time
+from queue import Queue
+from threading import Thread
 
 # Load environment variables from .env file
 load_dotenv()
@@ -24,70 +28,130 @@ FIREBASE_CONFIG = {
     "appId": os.environ.get("FIREBASE_APP_ID", "1:561553746659:web:4907152bdd320c1ae7f3d6")
 }
 
-@app.route('/api/process-video', methods=['POST'])
-def api_process_video():
-    if 'video_url' not in request.json:
-        return jsonify({'error': 'No video URL provided'}), 400
+# Store progress updates for each task
+progress_queues = {}
+
+@app.route('/api/progress/<task_id>', methods=['GET'])
+def progress(task_id):
+    """SSE endpoint for progress updates"""
+    def generate():
+        q = Queue()
+        progress_queues[task_id] = q
+        try:
+            while True:
+                progress = q.get()
+                if progress == 'DONE':
+                    del progress_queues[task_id]
+                    break
+                yield f"data: {json.dumps(progress)}\n\n"
+        except GeneratorExit:
+            if task_id in progress_queues:
+                del progress_queues[task_id]
     
-    video_url = request.json['video_url']
+    return Response(generate(), mimetype='text/event-stream')
+
+def process_video_task(video_url, task_id):
+    """Background task to process video and send progress updates"""
+    q = progress_queues.get(task_id)
+    if not q:
+        return
     
     try:
         # Create temporary files for processing
         temp_input = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         
+        # Update progress - Downloading
+        q.put({"status": "downloading", "progress": 0})
+        
         # Download the video
-        response = requests.get(video_url)
-        if response.status_code != 200:
-            return jsonify({'error': f'Failed to download video: {response.text}'}), 500
+        response = requests.get(video_url, stream=True)
+        total_size = int(response.headers.get('content-length', 0))
+        block_size = 8192
+        downloaded = 0
         
         with open(temp_input, 'wb') as f:
-            f.write(response.content)
+            for data in response.iter_content(block_size):
+                downloaded += len(data)
+                f.write(data)
+                if total_size:
+                    progress = int((downloaded / total_size) * 100)
+                    q.put({"status": "downloading", "progress": progress})
         
-        # Initialize watermark remover in debug mode to check for TikTok watermarks
+        # Update progress - Analyzing
+        q.put({"status": "analyzing", "progress": 0})
+        
+        # Initialize watermark remover
         remover = TikTokWatermarkRemover(debug=True)
         
-        # First, analyze the video to detect if it's a TikTok video
+        # Analyze video
         cap = cv2.VideoCapture(temp_input)
         if not cap.isOpened():
-            return jsonify({'error': 'Could not open video file'}), 500
-            
-        # Get first 5 seconds of frames
+            raise Exception('Could not open video file')
+        
         fps = cap.get(cv2.CAP_PROP_FPS)
         first_section_frames = min(int(5 * fps), int(cap.get(cv2.CAP_PROP_FRAME_COUNT)))
         
-        # Analyze first section for TikTok watermarks
+        # Analyze first section
         first_section_elements = remover._analyze_section(cap, 0, first_section_frames, "first_section")
         cap.release()
         
-        # If no TikTok watermarks detected, return original video
         if not first_section_elements or not any(key in first_section_elements for key in ['logo', 'logo_text']):
+            q.put({"status": "complete", "message": "No TikTok watermarks detected", "video_url": video_url})
+            q.put("DONE")
             os.unlink(temp_input)
             os.unlink(temp_output)
-            return jsonify({
-                'message': 'No TikTok watermarks detected',
-                'video_url': video_url  # Return original URL
-            })
+            return
         
-        # Process video to remove watermarks
-        print("TikTok watermarks detected, processing video...")
-        remover.process_video(temp_input, temp_output)
+        # Update progress - Processing
+        q.put({"status": "processing", "progress": 0})
         
-        # Return the processed video URL (this will be the Firebase Storage URL from frontend)
-        return jsonify({
-            'message': 'Video processed successfully',
-            'original_url': video_url,
-            'processed_url': video_url  # Frontend will handle the Firebase upload
+        # Process video
+        total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        
+        def progress_callback(frame_num):
+            progress = int((frame_num / total_frames) * 100)
+            q.put({"status": "processing", "progress": progress})
+        
+        remover.process_video(temp_input, temp_output, progress_callback=progress_callback)
+        
+        # Update progress - Complete
+        q.put({
+            "status": "complete",
+            "message": "Video processed successfully",
+            "video_url": video_url  # Frontend will handle final upload
         })
+        q.put("DONE")
+        
+        # Clean up
+        os.unlink(temp_input)
+        os.unlink(temp_output)
         
     except Exception as e:
-        # Clean up temporary files in case of error
+        q.put({"status": "error", "message": str(e)})
+        q.put("DONE")
         if 'temp_input' in locals() and os.path.exists(temp_input):
             os.unlink(temp_input)
         if 'temp_output' in locals() and os.path.exists(temp_output):
             os.unlink(temp_output)
-        
-        return jsonify({'error': str(e)}), 500
+
+@app.route('/api/process-video', methods=['POST'])
+def api_process_video():
+    if 'video_url' not in request.json:
+        return jsonify({'error': 'No video URL provided'}), 400
+    
+    video_url = request.json['video_url']
+    task_id = str(uuid.uuid4())
+    
+    # Start processing in background thread
+    thread = Thread(target=process_video_task, args=(video_url, task_id))
+    thread.daemon = True
+    thread.start()
+    
+    return jsonify({
+        'task_id': task_id,
+        'message': 'Processing started'
+    })
 
 @app.route('/api/remove-watermark', methods=['POST'])
 def remove_watermark():
@@ -155,4 +219,4 @@ def remove_watermark():
         }), 500
 
 if __name__ == '__main__':
-    app.run(debug=True) 
+    app.run(debug=True, threaded=True) 
