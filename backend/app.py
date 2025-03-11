@@ -181,38 +181,40 @@ def remove_watermark():
                 'message': 'No video URL provided'
             }), 400
         
-        # Download the video
-        video_path = download_video(video_url)
+        # Create a temporary file for the input video
+        temp_input = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         
-        if not video_path:
+        # Download the video from Firebase Storage URL
+        print(f"Downloading video from: {video_url}")
+        response = requests.get(video_url, stream=True)
+        if response.status_code != 200:
             return jsonify({
                 'success': False,
-                'message': 'Failed to download video'
+                'message': f'Failed to download video: {response.status_code}'
             }), 400
+            
+        # Save the video to the temporary file
+        with open(temp_input, 'wb') as f:
+            for chunk in response.iter_content(chunk_size=8192):
+                f.write(chunk)
         
-        # Generate output path
-        output_filename = f"processed_{os.path.basename(video_path)}"
-        output_path = os.path.join(UPLOAD_FOLDER, output_filename)
+        # Create a temporary file for the output video
+        temp_output = tempfile.NamedTemporaryFile(suffix='.mp4', delete=False).name
         
         # Remove the watermark
-        remover = WatermarkRemover(inpainting_method='opencv')
-        result = remover.remove_watermark(video_path, output_path)
+        remover = TikTokWatermarkRemover(debug=True)
+        remover.process_video(temp_input, temp_output)
         
-        if not result['success']:
-            return jsonify({
-                'success': False,
-                'message': result['message']
-            }), 400
-        
-        # Generate URL for the processed video
-        video_url = url_for('static', filename=f'uploads/{output_filename}', _external=True)
+        # Clean up the input file
+        os.unlink(temp_input)
         
         return jsonify({
             'success': True,
             'message': 'Watermark removed successfully',
-            'video_url': video_url
+            'video_path': temp_output
         })
     except Exception as e:
+        print(f"Error in remove_watermark: {str(e)}")
         return jsonify({
             'success': False,
             'message': f'Error: {str(e)}'
